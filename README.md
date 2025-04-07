@@ -1,0 +1,1 @@
+This is just a junk project to me learn and pre desenvolve some compiler stuff
