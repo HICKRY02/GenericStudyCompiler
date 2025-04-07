@@ -1,9 +1,9 @@
 #include <array>
-#include <atomic>
 #include <bitset>
 #include <cassert>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -11,11 +11,13 @@
 #include <format>
 #include <fstream>
 #include <functional>
-#include <initializer_list>
 #include <iostream>
+#include <iomanip>
 #include <list>
 #include <locale>
+#include <map>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <stack>
 #include <stdexcept>
@@ -23,7 +25,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
+#include <vector>
 
 template<typename T>
 union Point {
@@ -154,23 +156,26 @@ std::string GreedyMatching(std::string_view str, const PrefixTree& pattern) {
     return std::string(str.data(), longestMatch);
 }
 
-class Compiler;
-
 class Lexer {
 public:
     struct Token {
-        enum class Type {
+        enum class Type : std::uint8_t {
             EndOfFile,
-            Literal,
-            Identifier,
-            Keyword,
             Punctuation,
+            Identifier,
+            Literal,
+            Keyword,
             Unknown,
             Error
         };
 
-        Type        type;
-        std::string value;
+        struct Metadata {
+            Type                        type;
+            Range<Point<std::size_t>>   range;
+        };
+
+        std::string data;
+        Metadata    metadata;
     };
 
 private:
@@ -188,15 +193,15 @@ private:
     std::shared_ptr<PrefixTree>     punctuation;
     std::unique_ptr<std::istream>   stream;
 
-    bool ItsOver(Context& context) {
+    bool LoadNextLine(Context& context) {
         if (std::getline(*this->stream, this->buffer)) {
             context.str = this->buffer.c_str();
             context.range.end = 0;
             this->cursor.y++;
-            return false;
+            return true;
         }
 
-        return true;
+        return false;
     }
 
     void HandleStringLiteral(Context& context) {
@@ -234,24 +239,26 @@ private:
                             if ('\0' == context.cache) {
                                 buffer.append(context.str + context.range.start, context.range.end - context.range.start).push_back('\n');
 
-                                if (this->ItsOver(context))
-                                    throw std::runtime_error("Unterminated raw string literal: missing closing delimiter");
+                                if (this->LoadNextLine(context)) {
+                                    context.range.start = 0;
+                                    continue;
+                                }
 
-                                context.range.start = 0;
-                                continue;
+                                throw std::runtime_error("Unterminated raw string literal: missing closing delimiter");
                             }
 
                             context.range.end++;
                         } while (')' != context.cache);
-                        
+
                         if (strnlen(context.str + context.range.end, delimiterLength) < delimiterLength) {
                             buffer.append(context.str + context.range.start, context.range.end - context.range.start).push_back('\n');
 
-                            if (this->ItsOver(context))
-                                throw std::runtime_error("Unterminated raw string literal: missing closing delimiter");
-                            
-                            context.range.start = 0;
-                            continue;
+                            if (this->LoadNextLine(context)) {
+                                context.range.start = 0;
+                                continue;
+                            }
+
+                            throw std::runtime_error("Unterminated raw string literal: missing closing delimiter");
                         }
 
                         if (std::memcmp(context.str + context.range.end, delimiter.data(), delimiterLength))
@@ -274,9 +281,7 @@ private:
 
             if (_case != cases.end()) {
                 _case->second();
-            } else {
-                throw std::runtime_error("Unrecognized string literal format");
-            }
+            } else throw std::runtime_error("Unrecognized string literal format");
         } else {
             std::size_t accumulator;
             std::int32_t index;
@@ -442,7 +447,7 @@ private:
 
                     default:
                         if (escaping)
-                            // TODO:
+                            // TODO: improve this
                             throw std::runtime_error(std::format("Invalid escape character '{}'", context.cache));
 
                         buffer.push_back(context.cache);
@@ -455,8 +460,8 @@ private:
             buffer.push_back('\"');
         }
 
-        context.token.type = Token::Type::Literal;
-        context.token.value = std::move(buffer);
+        context.token.metadata.type = Token::Type::Literal;
+        context.token.data = std::move(buffer);
     }
 
     void HandleCharacterLiteral(Context& context) {
@@ -466,13 +471,11 @@ private:
 
         context.cache = context.str[++context.range.end];
 
-        if (context.cache == '\0')
+        if ('\0' == context.cache)
             throw std::runtime_error("Unterminated character literal");
 
-        if (context.cache == '\\') {
-            context.cache = context.str[++context.range.end];
-
-            switch (context.cache) {
+        if ('\\' == context.cache) {
+            switch (context.cache = context.str[++context.range.end]) {
                 case '\0':
                     throw std::runtime_error("Unterminated character literal");
 
@@ -501,7 +504,7 @@ private:
                 }
 
                 if (accumulator > 0xFF)
-                    throw std::runtime_error("Invalid octal escape sequence: exceeds ASCII range");
+                    throw std::runtime_error("Invalid octal escape sequence: exceeds ASCII range"); // TODO: format this
 
                 buffer.push_back(static_cast<char>(accumulator));
 
@@ -523,12 +526,27 @@ private:
 
                     break;
 
-                default:
-                    throw std::runtime_error(std::format("Invalid escape sequence '\\{}'", context.cache));
+                default: {
+                    buffer.push_back('\\');
+
+                    do {
+                        buffer.push_back(context.cache);
+
+                        if ('\'' == (context.cache = context.str[++context.range.end]))
+                            break;
+
+                        if ('\0' == context.cache)
+                            throw std::runtime_error("Invalid unclosored escape sequence: " + buffer);
+                    } while (true);
+
+                    context.range.end++;
+                    buffer.push_back('\'');
+
+                    throw std::runtime_error("Invalid escape sequence: " + buffer);
+                }
             }
-        } else {
+        } else
             buffer.push_back(context.cache);
-        }
 
         if ('\'' != context.str[++context.range.end])
             throw std::runtime_error("Unterminated character literal");
@@ -537,32 +555,18 @@ private:
 
         buffer.push_back('\'');
 
-        context.token.value = std::move(buffer);
-        context.token.type = Token::Type::Literal;
+        context.token.data = std::move(buffer);
+        context.token.metadata.type = Token::Type::Literal;
     }
 
 public:
-    static Lexer Create(std::unique_ptr<std::istream>&& stream) {
-        std::shared_ptr keywords = std::make_shared<PrefixTree>();
-
-        keywords->Insert({ "abstract", "auto", "bool", "break", "byte", "case", "cast", "catch", "class", "concept", "const", "constexpr", "continue", "decltype", "do", "double", "else", "enum", "export", "extern", "false", "for", "friend", "global", "if", "import", "int", "interface", "long", "module", "mutable", "namespace", "noexcept", "operator", "override", "private", "protected" "public", "restrict", "return", "short", "static", "static_assert", "struct", "switch", "template", "this", "throw", "true", "typedef", "using", "virtual", "volatile", "void", "while" });
-
-        std::shared_ptr punctuation = std::make_shared<PrefixTree>();
-
-        punctuation->Insert({ "!", "#", "$", "%", "&", "(", ")", "*", "+", ",", "-", ".", "/", ":", ";", "<", "=", ">", "?", "@", "[", "]", "^", "{", "|", "}", "~" });
-        punctuation->Insert({ "&&", "++", "--", "..", "...", "::", "<<", "==", ">>", "[[", "||", "]]" });
-        punctuation->Insert({ "!=", "*=", "+=", "-=", "/=", "<<=", ">>=", "^=", "|=", "~=", "->", "=>" });
-
-        return Lexer(std::move(stream), keywords, punctuation);
-    }
-
-    Lexer(std::unique_ptr<std::istream>&& stream, std::shared_ptr<PrefixTree> keywords, std::shared_ptr<PrefixTree> punctuation) : buffer(), cursor{ 1, 1 }, keywords(std::move(keywords)), punctuation(std::move(punctuation)), stream(std::move(stream)) {
+    Lexer(std::unique_ptr<std::istream>&& stream, std::shared_ptr<PrefixTree>&& keywords, std::shared_ptr<PrefixTree>&& punctuation) : buffer(), cursor{ 1, 1 }, keywords(std::move(keywords)), punctuation(std::move(punctuation)), stream(std::move(stream)) {
         if (!this->stream.get())
             throw std::invalid_argument("Invalid stream pointer"); // TODO: No such file or directory
         std::getline(*this->stream, this->buffer);
     }
 
-    std::pair<Range<Point<std::size_t>>, Token> GetNextToken() {
+    Token GetNextToken() {
         Context context;
         context.str = this->buffer.c_str();
         context.range.end = this->cursor.x - 1;
@@ -596,8 +600,8 @@ public:
                                 break;
 
                             default:
-                                context.token.type = Token::Type::Identifier;
-                                context.token.value = std::string(context.str + context.range.start, context.range.end - context.range.start);
+                                context.token.metadata.type = Token::Type::Identifier;
+                                context.token.data = std::string(context.str + context.range.start, context.range.end - context.range.start);
 
                                 break;
                         }
@@ -613,8 +617,8 @@ public:
                             break;
 
                         default:
-                            context.token.value = std::string(context.str + context.range.start, context.range.end - context.range.start);
-                            context.token.type = this->keywords->Search(context.token.value) ? Token::Type::Keyword : Token::Type::Identifier;
+                            context.token.data = std::string(context.str + context.range.start, context.range.end - context.range.start);
+                            context.token.metadata.type = this->keywords->Search(context.token.data) ? Token::Type::Keyword : Token::Type::Identifier;
 
                             break;
                     }
@@ -640,12 +644,12 @@ public:
                                     do {
                                         context.cache = context.str[++context.range.end];
                                     } while (std::isdigit(context.cache));
-    
+
                                     switch (context.cache) {
                                         case 'F': case 'f':
                                         case 'L': case 'l':
                                             context.cache = context.str[++context.range.end];
-    
+
                                         default:
                                             break;
                                     }
@@ -679,12 +683,12 @@ public:
                                 do {
                                     context.cache = context.str[++context.range.end];
                                 } while (std::isdigit(context.cache));
-    
+
                                 switch (context.cache) {
                                     case 'F': case 'f':
                                     case 'L': case 'l':
                                         context.cache = context.str[++context.range.end];
-    
+
                                     default:
                                         break;
                                 }
@@ -692,8 +696,14 @@ public:
                         }
                     }
 
-                    context.token.type = Token::Type::Literal;
-                    context.token.value = std::string(context.str + context.range.start, context.range.end - context.range.start);
+                    if (std::isalnum(context.str[context.range.end])) { // Experimental
+                        while (std::isalnum(context.str[++context.range.end]));
+
+                        throw std::runtime_error("Invalid sequence"); // TODO: Imporve this
+                    }
+
+                    context.token.data = std::string(context.str + context.range.start, context.range.end - context.range.start);
+                    context.token.metadata.type = Token::Type::Literal;
                 } else if (std::ispunct(context.cache)) {
                     switch (context.cache) {
                         case '\"':
@@ -710,10 +720,10 @@ public:
                             context.cache = context.str[context.range.end + 1];
 
                             if ('/' == context.cache) {
-                                if (!ItsOver(context))
+                                if (LoadNextLine(context))
                                     continue;
 
-                                context.token.type = Token::Type::EndOfFile;
+                                context.token.metadata.type = Token::Type::EndOfFile;
 
                                 break;
                             } else if ('*' == context.cache) {
@@ -724,7 +734,7 @@ public:
                                         context.cache = context.str[context.range.end];
 
                                         if ('\0' == context.cache) {
-                                            if (!ItsOver(context))
+                                            if (LoadNextLine(context))
                                                 continue;
 
                                             throw std::runtime_error("Unclosed multi-line comment.");
@@ -740,11 +750,11 @@ public:
                             }
 
                         default:
-                            context.token.value = GreedyMatching(context.str + context.range.start, *this->punctuation);
-                            context.range.end += context.token.value.length();
+                            context.token.data = GreedyMatching(context.str + context.range.start, *this->punctuation);
+                            context.range.end += context.token.data.length();
 
                             if (context.range.start != context.range.end) {
-                                context.token.type = Token::Type::Punctuation;
+                                context.token.metadata.type = Token::Type::Punctuation;
                             } else {
                                 do {
                                     context.cache = context.str[++context.range.end];
@@ -762,1064 +772,635 @@ public:
                                     }
                                 } while (std::ispunct(context.cache));
 
-                                context.token.type = Token::Type::Unknown;
-                                context.token.value = std::string(context.str + context.range.start, context.range.end - context.range.start);
+                                context.token.metadata.type = Token::Type::Unknown;
+                                context.token.data = std::string(context.str + context.range.start, context.range.end - context.range.start);
                             }
 
                             break;
                     }
                 } else if ('\0' == context.cache) {
-                    if (!ItsOver(context))
+                    if (LoadNextLine(context))
                         continue;
 
-                    context.token.type = Token::Type::EndOfFile;
+                    context.token.metadata.type = Token::Type::EndOfFile;
                 } else {
                     do {
                         context.cache = context.str[++context.range.end];
                     } while (!(std::isspace(context.cache) || '\0' == context.cache));
 
-                    context.token.type = Token::Type::Unknown;
-                    context.token.value = std::string(context.str + context.range.start, context.range.end - context.range.start);
+                    context.token.data = std::string(context.str + context.range.start, context.range.end - context.range.start);
+                    context.token.metadata.type = Token::Type::Unknown;
                 }
 
-                this->cursor.x = context.range.end + 1;
-
-                return std::make_pair<Range<Point<std::size_t>>, Token>({context.cursor, this->cursor}, std::move(context.token));
+                break;
             } while (1);
         } catch (const std::exception& e) {
-            return std::make_pair<Range<Point<std::size_t>>, Token>({context.cursor, this->cursor}, Token{ .type = Token::Type::Error, .value = e.what() }); // maybe this->cursor it's not right in this case
+            context.token.data = e.what();
+            context.token.metadata.type = Token::Type::Error;
         }
+
+        this->cursor.x = context.range.end + 1;
+
+        context.token.metadata.range = { context.cursor, this->cursor };
+
+        return context.token;
     }
 };
 
+template<typename T>
 class IdentifierGenerator {
-    std::size_t accumulator;
+    T   accumulator;
 
 public:
-    IdentifierGenerator() : accumulator(0) {}
+    IdentifierGenerator() : accumulator() {}
 
-    std::size_t operator()() {
+    T operator()() {
         return accumulator++;
     }
 };
 
-class Symbol {
-public:
-    class Factory {
-    public:
-        
-    };
+/* Grammar:
 
-    struct Scope {
-        std::string                                                 title;
-        std::vector<std::variant<Scope, std::shared_ptr<Symbol>>>   data;
-        std::unordered_map<std::string, std::shared_ptr<Symbol>>    nameTable;
-        Scope*                                                      parent;
+Punctuation -> "!" | "#" | "$" | "%" | "&" | "(" | ")" | "*" | "+" | "|" | "-" | "." | "/" | ":" | ";" | "<" | "=" | ">" | "?" | "@" | "[" | "]" | "^" | "{" | "|" | "}" | "~" "&&" | "++" | "--" | ".." | "..." | "::" | "<<" | "==" | ">>" | "[[" | "||" | "]]" "!=" | "*=" | "+=" | "-=" | "/=" | "<<=" | ">>=" | "^=" | "|=" | "~=" | "->" | "=>"
 
-        std::shared_ptr<Symbol> Find(std::string& name) {
-            auto it = this->nameTable.find(name);
-            if (this->nameTable.end() != it)
-                return it->second;
-            return this->parent ? this->parent->Find(name) : nullptr;
-        }
-    };
+𝑆'  -> $
 
-    class Table {
-        friend class Symbol;
+𝐺 = (𝑁, Σ, 𝑃, 𝑆)
 
-        Scope                                                       root;
-        Scope*                                                      current;
-        std::unordered_map<std::size_t, std::shared_ptr<Symbol>>    idTable;
-        IdentifierGenerator                                         idGenerator;
-
-    public:
-        std::shared_ptr<Symbol> Get(std::size_t id) {
-            auto it = this->idTable.find(id);
-            if (this->idTable.end() != it)
-                return it->second;
-            return nullptr;
-        }
-
-        std::shared_ptr<Symbol> Get(std::string& name) {
-            return this->current->Find(name);
-        }
-
-        Table() : root{"Program"}, current(), idTable(), idGenerator() {
-            this->current = &this->root;
-        }
-
-        std::size_t AddSymbol(std::shared_ptr<Symbol>&& symbol) {
-            std::size_t id = this->idGenerator();
-            this->current->nameTable[symbol->name] = symbol;
-            this->idTable[symbol->id = id] = std::move(symbol);
-            return id;
-        }
-    };
-
-private:
-    std::size_t id;
-    std::string name;
-
-public:
-    std::size_t GetId() const noexcept {
-        return this->id;
-    }
-};
-
-class AbstractSyntaxTree {
-public:
-    struct Node {
-        std::vector<Node>                                       children;
-        std::string                                             type;
-        std::optional<std::variant<std::string, std::size_t>>   value;
-        Range<Point<std::size_t>>                               range;
-
-        void Print(std::uint32_t indentationLevel = 0) const noexcept {
-            constexpr static char colors[3] = { '3', '5', '6' };
-            std::cout << std::format("\033[3{}m{}\033[0m", colors[(indentationLevel / 2) % 3], this->type);
-            if (this->value.has_value())
-                std::cout << std::format(" ({})", std::holds_alternative<std::string>(this->value.value()) ? std::get<std::string>(this->value.value()) : std::to_string(std::get<std::size_t>(this->value.value())));
-            std::cout << '\n';
-            indentationLevel += 2;
-            std::string prefix(indentationLevel, ' ');
-            for (const Node& child : this->children) {
-                std::cout << prefix;
-                child.Print(indentationLevel);
-            }
-        }
-    };
-
-    Node            root;
-};
+*/
 
 class Parser {
-private:
-    using Context = std::pair<Range<Point<std::size_t>>, Lexer::Token>;
+public:
+    using SizeType      = std::int32_t;
+    using State         = std::int32_t;
+    using Symbol        = std::string;
 
-    Lexer                                               lexer;
-    Compiler&                                           compiler;
-    Context                                             current;
-    std::string                                         path;
-    std::deque<Context>                                 future;
-    std::unordered_set<std::string_view>                unaryOperators;
-    std::unordered_map<std::string_view, std::int32_t>  binaryOperators;
+    struct Tree {
+        struct Node {
+            std::vector<Node>   children;
+            std::string         label;
 
-    inline void Consume() {
-        if (this->future.empty())
-            this->current = this->lexer.GetNextToken();
-        else {
-            this->current = this->future.front();
-            this->future.pop_front();
-        }
-    }
-    // front [0] deque back []...
-    inline void LookAhead() {
-        this->future.push_back(this->lexer.GetNextToken());
-    }
-
-    inline void Expect(std::string_view expected) {
-        if (expected != this->current.second.value)
-            throw std::runtime_error(std::format("Unexpected token: \'{}\' at ({}:{}:{})", this->current.second.value, this->path, this->current.first.start.y, this->current.first.start.x));
-        
-        this->Consume();
-    }
-
-    inline bool IsUnaryOperator(std::string_view op) const noexcept {
-        return this->unaryOperators.contains(op);
-    }
-
-    inline bool IsBinaryOperator(std::string_view op) const noexcept {
-        return this->binaryOperators.contains(op);
-    }
-
-    inline std::int32_t GetOperatorPrecendece(std::string_view op) const noexcept {
-        return this->IsBinaryOperator(op) ? this->binaryOperators.at(op) : -1;
-    }
-
-    inline static bool IsBultinType(std::string_view op) noexcept {
-        static std::unordered_set<std::string_view> builtinTypes = { "bool", "char", "double", "float", "int", "long", "short", "void" };
-        return builtinTypes.contains(op);
-    }
-
-    inline static bool IsTypeModifierKeyword(std::string_view op) noexcept {
-        static std::unordered_set<std::string_view> builtinTypes = { "const", "constexpr", "mutable", "restrict", "static", "unsigned", "volatile" };
-        return builtinTypes.contains(op);
-    }
-
-    inline static bool IsTypeModifier(std::string_view op) noexcept {
-        static std::unordered_set<std::string_view> builtinTypes = { "*", "&", "&&" };
-        return builtinTypes.contains(op) | Parser::IsTypeModifierKeyword(op);
-    }
-
-    inline static bool IsCallableModifierKeyword(std::string_view op) noexcept {
-        static std::unordered_set<std::string_view> builtinTypes = { "const", "noexcept", "override", "static" };
-        return builtinTypes.contains(op) | Parser::IsTypeModifierKeyword(op);
-    }
-
-    AbstractSyntaxTree::Node ParseAs(std::string&& as) {
-        std::string identifier = std::move(this->current.second.value);
-
-        this->Consume();
-
-        return {
-            .children = {},
-            .type = std::move(as),
-            .value = std::move(identifier)
-        };
-    }
-
-    bool IsType() const noexcept {
-        return Lexer::Token::Type::Identifier == this->current.second.type || this->IsBultinType(this->current.second.value);
-    }
-
-    AbstractSyntaxTree::Node ParseType() {
-        AbstractSyntaxTree::Node node = {
-            .children = {},
-            .type = "Type",
-            .value = std::nullopt
-        };
-
-        while (Parser::IsTypeModifier(this->current.second.value)) {
-            node.children.push_back({
-                .children = {},
-                .type = "Modifier",
-                .value = std::move(this->current.second.value)
-            });
-
-            this->Consume();
-        }
-
-        if (!this->IsType())
-            throw std::runtime_error("Invalid Type");
-
-        AbstractSyntaxTree::Node type = this->ParseAs("Identifier"); // TODO: check this in action
-
-        while (true) {
-            if ("::" == this->current.second.value) {
-                this->ParseAccessExpression(node);
-
-                continue;
-            }
-
-            if ("<" == this->current.second.value) {
-                this->ParseTemplate(node);
-                
-                continue;
-            }
-
-            break;
-        }
-
-        node.children.push_back(std::move(type));
-
-        while (Parser::IsTypeModifier(this->current.second.value)) {
-            node.children.push_back({
-                .children = {},
-                .type = "Modifier",
-                .value = std::move(this->current.second.value)
-            }); // TODO: improve this
-
-            this->Consume();
-        }
-
-        return node;
-    }
-
-    std::vector<AbstractSyntaxTree::Node> ParseBlock() {
-        Point blockStart = this->current.first.start;
-
-        this->Consume();
-
-        std::vector<AbstractSyntaxTree::Node> nodes;
-
-        while ("}" != this->current.second.value) {
-            nodes.push_back(this->ParseStatment());
-
-            if (Lexer::Token::Type::EndOfFile == this->current.second.type)
-                throw std::runtime_error(std::format("Unclosored block ({}:{}:{})", this->path, blockStart.y, blockStart.x)); // TODO: improve this
-        }
-
-        this->Consume();
-
-        return nodes;
-    }
-
-    AbstractSyntaxTree::Node ParseBody() {
-        return {
-            .children = "{" == this->current.second.value ? this->ParseBlock() : std::vector<AbstractSyntaxTree::Node>{ this->ParseStatment() },
-            .type = "Body",
-            .value = std::nullopt
-        };
-    }
-
-    AbstractSyntaxTree::Node ParseInitializerList() {
-        this->Consume();
-
-        AbstractSyntaxTree::Node node = {
-            .children = {},
-            .type = "Initializer List",
-            .value = std::nullopt
-        };
-
-        if ("}" != this->current.second.value) {
-            while (true) {
-                if ("." == this->current.second.value) {
-                    this->Consume();
-
-                    AbstractSyntaxTree::Node designator = {
-                        .children = { this->ParseAs("Identifier"), },
-                        .type = "Designator",
-                        .value = std::nullopt
-                    };
-
-                    this->Expect("=");
-
-                    designator.children.push_back(this->ParseExpression());
-
-                    node.children.push_back(std::move(designator));
-                } else if ("[" == this->current.second.value) {
-                    throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-                } else node.children.push_back(this->ParseExpression());
-
-                if ("," == this->current.second.value) {
-                    this->Consume();
-                    
-                    continue;
+            void Print(std::uint32_t indentationLevel = 0) const noexcept {
+                constexpr static char colors[3] = { '3', '5', '6' };
+                std::cout << std::format("\033[3{}m{}\033[0m", colors[(indentationLevel / 2) % 3], this->label);
+                std::cout << '\n';
+                indentationLevel += 2;
+                std::string prefix(indentationLevel, ' ');
+                for (const Node& child : this->children) {
+                    std::cout << prefix;
+                    child.Print(indentationLevel);
                 }
-
-                if ("}" == this->current.second.value)
-                    break;
-
-                throw std::runtime_error(std::format("Unclosored initializer list at ({}:{}:{})", this->path, this->current.first.start.y, this->current.first.start.x));
             }
-        }
-
-        this->Consume();
-
-        return node;
-    }
-
-    void ParseCall(AbstractSyntaxTree::Node& base) {
-        this->Consume();
-
-        base = {
-            .children = { std::move(base), },
-            .type = "Call",
-            .value = std::nullopt
         };
 
-        if (")" != this->current.second.value) {
-            AbstractSyntaxTree::Node arguments = {
-                .children = {},
-                .type = "Arguments",
-                .value = std::nullopt
+        Node root;
+    };
+
+    struct Action {
+        enum class Type : std::uint8_t {
+            Error,
+            Shift,
+            Reduce,
+            Accept
+        };
+
+        Type    type;
+        State   value;
+    };
+
+    struct Production {
+        Symbol              lhs;
+        std::vector<Symbol> rhs;
+    };
+
+    struct Model {
+        using ActionTable           = std::map<std::pair<State, Symbol>, Action>;
+        using ProductionTable       = std::vector<Production>;
+        using GotoTable             = std::map<std::pair<State, Symbol>, State>;
+        using TokenClassifier       = std::function<Symbol(Lexer::Token&)>;
+        using TokenNodifier         = std::function<Tree::Node(Lexer::Token&)>;
+
+        ActionTable             actionTable;
+        ProductionTable         productions;
+        GotoTable               gotoTable;
+        TokenClassifier         classifier;
+        TokenNodifier           tokenNodifier;
+
+        void SetAction(State state, std::string symbol, Action action) {
+            this->actionTable[{ state, symbol }] = action;
+        }
+
+        void RemoveAction(State state, std::string symbol) {
+            this->actionTable.erase({ state, symbol });
+        }
+
+        bool HasAction(State state, std::string symbol) const {
+            return this->actionTable.end() == this->actionTable.find({ state, symbol });
+        }
+
+        Action GetAction(State state, std::string symbol) const {
+            auto it = this->actionTable.find({ state, symbol });
+            if (this->actionTable.end() == it)
+                throw std::runtime_error(std::format("Action ({}:\"{}\") not found", state, symbol));
+            return it->second;
+        }
+
+        void SetGoto(State state, std::string symbol, State target) {
+            this->gotoTable[{ state, symbol }] = target;
+        }
+
+        void RemoveGoto(State state, std::string symbol) {
+            this->gotoTable.erase({ state, symbol });
+        }
+
+        bool HasGoto(State state, std::string symbol) const {
+            return this->gotoTable.end() == this->gotoTable.find({ state, symbol });
+        }
+
+        State GetGoto(State state, std::string symbol) const {
+            auto it = this->gotoTable.find({ state, symbol });
+            if (this->gotoTable.end() == it)
+                throw std::runtime_error(std::format("Goto ({}:\"{}\") not found", state, symbol));
+            return it->second;
+        }
+    };
+
+    class Grammar {
+        struct Item {
+            Symbol              lhs;
+            std::vector<Symbol> rhs;
+            SizeType            dot;
+            Symbol              lookahead;
+
+            bool operator<(const Item& other) const {
+                if (this->lhs != other.lhs)
+                    return this->lhs < other.lhs;
+                if (this->rhs != other.rhs)
+                    return this->rhs < other.rhs;
+                if (this->dot != other.dot)
+                    return this->dot < other.dot;
+                return this->lookahead < other.lookahead;
+            }
+
+            bool operator==(const Item& other) const {
+                return this->lhs == other.lhs && this->rhs == other.rhs && this->dot == other.dot && this->lookahead == other.lookahead;
+            }
+        };
+
+        std::shared_ptr<Model>                      model;
+        std::set<Symbol>                            terminals;
+        std::set<Symbol>                            nonTerminals;
+        Symbol                                      𝑆;
+        std::map<Symbol, std::set<Symbol>>          firstSets;
+        std::vector<std::set<Item>>                 C;
+
+        void ComputeFirstSets() {
+            for (auto& t : terminals)
+                firstSets[t] = {t};
+            for (auto& nt : nonTerminals)
+                firstSets[nt] = {};
+            bool changed;
+            do {
+                changed = false;
+                for (auto& p : this->model->productions) {
+                    auto& A = p.lhs;
+                    auto& alpha = p.rhs;
+                    auto& firstA = firstSets[A];
+                    std::set<Symbol> temp;
+                    bool allEpsilon = true;
+                    for (auto& X : alpha) {
+                        for (auto& sym : firstSets[X])
+                            if (sym != "ε")
+                                temp.insert(sym);
+                        if (firstSets[X].count("ε") == 0) {
+                            allEpsilon = false;
+                            break;
+                        }
+                    }
+                    if (allEpsilon) temp.insert("ε");
+                    size_t before = firstA.size();
+                    firstA.insert(temp.begin(), temp.end());
+                    if (firstA.size() != before) changed = true;
+                }
+            } while (changed);
+        }
+    
+        std::set<Symbol> First(const std::vector<Symbol>& symbols) const {
+            std::set<Symbol> result;
+            bool allEpsilon = true;
+            for (auto& X : symbols) {
+                for (auto& sym : firstSets.at(X))
+                    if (sym != "ε")
+                        result.insert(sym);
+                if (firstSets.at(X).count("ε") == 0) {
+                    allEpsilon = false;
+                    break;
+                }
+            }
+            if (allEpsilon) result.insert("ε");
+            return result;
+        }
+    
+        // Fecho (closure) de itens
+        std::set<Item> Closure(const std::set<Item>& I) const {
+            std::set<Item> closureSet = I;
+            bool added;
+            do {
+                added = false;
+                for (auto& it : closureSet) {
+                    if (it.dot < it.rhs.size()) {
+                        Symbol B = it.rhs[it.dot];
+                        if (nonTerminals.count(B)) {
+                            std::vector<Symbol> beta(it.rhs.begin() + it.dot + 1, it.rhs.end());
+                            beta.push_back(it.lookahead);
+                            auto lookaheadSet = this->First(beta);
+                            for (auto& p : this->model->productions) {
+                                if (p.lhs == B) {
+                                    for (auto& la : lookaheadSet) {
+                                        Item newItem = { B, p.rhs, 0, la };
+                                        if (!closureSet.count(newItem)) {
+                                            closureSet.insert(newItem);
+                                            added = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } while (added);
+            return closureSet;
+        }
+    
+        // Função GOTO
+        std::set<Item> GotoFunction(const std::set<Item>& I, const Symbol& X) const {
+            std::set<Item> J;
+            for (auto& it : I)
+                if (it.dot < it.rhs.size() && it.rhs[it.dot] == X)
+                    J.insert({ it.lhs, it.rhs, it.dot + 1, it.lookahead });
+            return this->Closure(J);
+        }
+    
+        // Construção da coleção canônica de itens
+        void Items() {
+                    // Gramática aumentada S' -> startSymbol
+            Symbol augmentedStart = this->𝑆 + "'";
+            // Remove produção aumentada anterior, se existir
+            this->model->productions.erase(std::remove_if(this->model->productions.begin(), this->model->productions.end(),
+                [&](const Production &p) { return p.lhs == augmentedStart; }), this->model->productions.end());
+            this->AddNonTerminal(augmentedStart);
+            this->model->productions.insert(this->model->productions.begin(), { augmentedStart, { this->𝑆 } });
+            this->ComputeFirstSets();
+            Item startItem = { augmentedStart, { this->𝑆 }, 0, "EndOfFile" };
+            this->C.clear();
+            this->C.push_back(this->Closure({startItem}));
+            bool added;
+            do {
+                added = false;
+                std::set<Symbol> symbols = terminals;
+                symbols.insert(nonTerminals.begin(), nonTerminals.end());
+                for (int i = 0; i < (int)this->C.size(); ++i) {
+                    for (auto& X : symbols) {
+                        auto gotoSet = this->GotoFunction(C[i], X);
+                        if (!gotoSet.empty() && std::find(this->C.begin(), this->C.end(), gotoSet) == this->C.end()) {
+                            this->C.push_back(gotoSet);
+                            added = true;
+                        }
+                    }
+                }
+            } while (added);
+        }
+
+        int FindState(const std::set<Item>& I) const {
+            for (int i = 0; i < (int)this->C.size(); ++i)
+                if (this->C[i] == I)
+                    return i;
+            return -1;
+        }
+    
+        int FindProductionIndex(const Symbol& lhs, const std::vector<Symbol>& rhs) const {
+            for (int i = 0; i < (int)this->model->productions.size(); ++i)
+                if (this->model->productions[i].lhs == lhs && this->model->productions[i].rhs == rhs)
+                    return i;
+            return -1;
+        }
+
+    public:
+        std::shared_ptr<Model> GetModel() noexcept { return this->model; }
+
+        Grammar(const std::string& 𝑆) : model(std::make_shared<Model>()), 𝑆(𝑆) {
+            this->AddTerminal("EndOfFile");
+            this->AddTerminal("Identifier");
+            this->AddTerminal("Literal");
+
+            this->model->classifier = [this](Lexer::Token& token) -> Symbol {
+                switch (token.metadata.type) {
+                    case Lexer::Token::Type::EndOfFile:
+                        return "EndOfFile";
+
+                    case Lexer::Token::Type::Error:
+                        throw std::runtime_error(token.data);
+
+                    case Lexer::Token::Type::Identifier:
+                        return "Identifier";
+
+                    case Lexer::Token::Type::Keyword:
+                        return token.data;
+
+                    case Lexer::Token::Type::Literal:
+                        return "Literal";
+
+                    case Lexer::Token::Type::Punctuation:
+                        return token.data;
+
+                    case Lexer::Token::Type::Unknown:
+                        throw std::runtime_error("Unknown");
+
+                    default:
+                        throw std::bad_exception();
+                }
             };
 
-            while (true) {
-                arguments.children.push_back(this->ParseExpression());
+            this->model->tokenNodifier = [](Lexer::Token& token) -> Tree::Node {
+                Tree::Node node;
 
-                if ("," == this->current.second.value) {
-                    this->Consume();
-
-                    continue;
-                }
-
-                if (")" == this->current.second.value)
-                    break;
-
-                throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-            }
-
-            base.children.push_back(std::move(arguments));
-        }
-
-        this->Consume();
-    }
-
-    void ParseIndexing(AbstractSyntaxTree::Node& base) {
-        this->Consume();
-
-        if ("]" == this->current.second.value)
-            throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-
-        AbstractSyntaxTree::Node arguments = {
-            .children = {},
-            .type = "Arguments",
-            .value = std::nullopt
-        };
-
-        AbstractSyntaxTree::Node argument;
-
-        while (true) {
-            if (".." == this->current.second.value || "..." == this->current.second.value) {
-                arguments.children.push_back({
-                    .children = {
-                        this->ParseAs("Operator"),
-                        this->ParseExpression()
-                    },
-                    .type = "Range",
-                    .value = std::nullopt
-                });
-            } else {
-                argument = this->ParseExpression();
-
-                if (".." == this->current.second.value || "..." == this->current.second.value) {
-                    argument = {
-                        .children = {
-                            std::move(argument),
-                            this->ParseAs("Operator")
-                        },
-                        .type = "Range",
-                        .value = std::nullopt
-                    };
-
-                    if ("," == this->current.second.value) {
-                        this->Consume();
-
-                        arguments.children.push_back(std::move(argument));
-
-                        continue;
-                    }
-
-                    if ("]" == this->current.second.value) {
-                        arguments.children.push_back(std::move(argument));
-
+                switch (token.metadata.type) {
+                    case Lexer::Token::Type::EndOfFile:
+                        node.label = "EndOfFile";
                         break;
+
+                    case Lexer::Token::Type::Error:
+                        throw std::runtime_error(token.data);
+
+                    case Lexer::Token::Type::Identifier:
+                        node.label = std::format("Identifier: \"{}\"", token.data);
+                        break;
+
+                    case Lexer::Token::Type::Keyword:
+                        node.label = token.data;
+                        break;
+
+                    case Lexer::Token::Type::Literal:
+                        node.label = std::format("Literal: \"{}\"", token.data);
+                        break;
+
+                    case Lexer::Token::Type::Punctuation:
+                        node.label = token.data;
+                        break;
+
+                    case Lexer::Token::Type::Unknown:
+                        throw std::runtime_error("Unknown");
+
+                    default:
+                        throw std::bad_exception();
+                }
+
+                return node;
+            };
+        }
+
+        void AddTerminal(std::string t) {
+            this->terminals.insert(t);
+        }
+
+        void AddNonTerminal(std::string nt) {
+            this->nonTerminals.insert(nt);
+        }
+
+        void AddProduction(std::string&& lhs, std::vector<std::string>&& rhs) {
+            this->model->productions.push_back({ std::move(lhs), std::move(rhs) });
+        }
+
+        void BuildParsingTable() {
+            this->model->actionTable.clear();
+            this->model->gotoTable.clear();
+            this->Items();
+            for (int i = 0; i < (int)this->C.size(); ++i) {
+                for (auto& it : this->C[i]) {
+                    if (it.dot < it.rhs.size()) {
+                        Symbol a = it.rhs[it.dot];
+                        if (terminals.count(a))
+                            this->model->SetAction(i, a, { Action::Type::Shift, this->FindState(this->GotoFunction(this->C[i], a)) });
+                    } else {
+                        if (it.lhs == this->𝑆 + "'")
+                            this->model->SetAction(i, "EndOfFile", { Action::Type::Accept, 0 });
+                        else
+                            this->model->SetAction(i, it.lookahead, { Action::Type::Reduce, this->FindProductionIndex(it.lhs, it.rhs) });
+                    }
+                }
+                for (auto& A : nonTerminals) {
+                    auto gotoSet = this->GotoFunction(C[i], A);
+                    if (!gotoSet.empty()) {
+                        this->model->SetGoto(i, A, this->FindState(gotoSet));
+                    }
+                }
+            }
+        }
+    };
+
+private:
+    Lexer                   lexer;
+    std::shared_ptr<Model>  model;
+
+public:
+    Parser(Lexer&& lexer, std::shared_ptr<Model>&& model) : lexer(std::move(lexer)), model(std::move(model)) {}
+
+    Tree Parse() {
+        std::stack<Tree::Node> nodeStack;
+        std::stack<int> stateStack;
+
+        stateStack.push(0);
+
+        Tree::Node bufferNode;
+        Lexer::Token currentToken = this->lexer.GetNextToken();
+        State currentState;
+        Symbol currentSym;
+        Action act;
+        Production p;
+
+        while (true) {
+            currentState = stateStack.top();
+
+            currentSym = this->model->classifier(currentToken);
+
+            act = this->model->GetAction(currentState, currentSym);
+
+            switch (act.type) {
+                case Action::Type::Shift:
+                    stateStack.push(act.value);
+                    nodeStack.push(this->model->tokenNodifier(currentToken));
+                    currentToken = this->lexer.GetNextToken();
+
+                    break;
+
+                case Action::Type::Reduce:
+                    p = this->model->productions[act.value];
+
+                    bufferNode.label = p.lhs;
+
+                    for (SizeType i = 0; i < (SizeType)p.rhs.size(); i++) {
+                        bufferNode.children.push_back(std::move(nodeStack.top()));
+                        nodeStack.pop();
+
+                        stateStack.pop();
                     }
 
-                    argument.children.push_back(this->ParseExpression());
+                    std::reverse(bufferNode.children.begin(), bufferNode.children.end());
 
-                    arguments.children.push_back(std::move(argument));
-                } else {
-                    arguments.children.push_back({
-                        .children = { std::move(argument) },
-                        .type = "Expression",
-                        .value = std::nullopt
-                    });
-                }
-            }
+                    stateStack.push(this->model->GetGoto(stateStack.top(), p.lhs));
+                    nodeStack.push(std::move(bufferNode));
 
-            if ("," == this->current.second.value) {
-                this->Consume();
-
-                continue;
-            }
-
-            if ("]" == this->current.second.value)
-                break;
-
-            throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-        }
-
-        this->Consume();
-
-        base = {
-            .children = {
-                std::move(base),
-                std::move(arguments)
-            },
-            .type = "Indexing",
-            .value = std::nullopt
-        };
-    }
-
-    void ParseTemplate(AbstractSyntaxTree::Node& base) {
-        this->Consume();
-
-        AbstractSyntaxTree::Node arguments = {
-            .children = {},
-            .type = "Arguments",
-            .value = std::nullopt
-        };
-
-        while (true) {
-            if (Lexer::Token::Type::Identifier == this->current.second.type || Lexer::Token::Type::Keyword == this->current.second.type) {
-                arguments.children.push_back(this->ParseAs("Identifier"));
-            } else if (Lexer::Token::Type::Literal == this->current.second.type) {
-                arguments.children.push_back(this->ParseAs("Literal"));
-            } else {
-                arguments.children.push_back(this->ParseExpression());
-            }
-
-            if ("," == this->current.second.value) {
-                this->Consume();
-                continue;
-            }
-
-            if (">" == this->current.second.value) {
-                this->Consume();
-                break;
-            }
-
-            throw std::runtime_error("Unexpected token in template arguments: " + this->current.second.value);
-        }
-
-        base = {
-            .children = {
-                std::move(base),
-                std::move(arguments)
-            },
-            .type = "Template",
-            .value = std::nullopt
-        };
-    }
-
-    void ParseAccessExpression(AbstractSyntaxTree::Node& base) {
-        base = {
-            .children = {
-                std::move(base),
-                this->ParseAs("Operator"),
-                this->ParseAs("Identifier")
-            },
-            .type = "Access Expression",
-            .value = std::nullopt
-        };
-    }
-
-    void ParseChain(AbstractSyntaxTree::Node& base) {
-        while (true) {
-            if ("." == this->current.second.value || "->" == this->current.second.value || "::" == this->current.second.value) {
-                this->ParseAccessExpression(base);
-
-                continue;
-            }
-
-            if ("(" == this->current.second.value) {
-                this->ParseCall(base);
-
-                continue;
-            }
-
-            if ("[" == this->current.second.value) {
-                this->ParseIndexing(base);
-
-                continue;
-            }
-
-            if ("<" == this->current.second.value) {
-                this->ParseTemplate(base);
-
-                if ("::" == this->current.second.value) {
-                    this->ParseAccessExpression(base);
-
-                    continue;
-                }
-
-                if ("(" == this->current.second.value) {
-                    this->ParseCall(base);
-
-                    continue;
-                }
-
-                if ("." == this->current.second.value || "->" == this->current.second.value || "[" == this->current.second.value) {
-                    this->ParseIndexing(base);
-
-                    throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-                }
-            }
-
-            break;
-        }
-    }
-
-    AbstractSyntaxTree::Node ParseParameter() {
-        AbstractSyntaxTree::Node node = {
-            .children = {
-                this->ParseType(),
-                this->ParseAs("Identifier")
-            },
-            .type = "Parameter",
-            .value = std::nullopt
-        };
-
-        if ("=" == this->current.second.value) {
-            this->Consume();
-
-            node.children.push_back(this->ParseExpression());
-        }
-
-        return node;
-    }
-
-    AbstractSyntaxTree::Node ParseParameters() {
-        AbstractSyntaxTree::Node node = {
-            .children = {},
-            .type = "Parameters",
-            .value = std::nullopt,
-            .range = { this->current.first.start, {} }
-        };
-
-        this->Consume();
-
-        while (true) {
-            node.children.push_back(this->ParseParameter());
-
-            if ("," == this->current.second.value) {
-                this->Consume();
-
-                continue;
-            }
-
-            if (")" == this->current.second.value)
-                break;
-
-            throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-        }
-
-        node.range.end = this->current.first.end;
-
-        this->Consume();
-
-        return node;
-    }
-
-    AbstractSyntaxTree::Node ParseLambdaExpression() {
-        this->Consume();
-
-        AbstractSyntaxTree::Node node = {
-            .children = {},
-            .type = "Lambda Expression",
-            .value = std::nullopt
-        };
-
-        if ("]" != this->current.second.value) {
-            AbstractSyntaxTree::Node foo = {
-                .children = {},
-                .type = "Capture",
-                .value = std::nullopt
-            };
-
-            while (true) {
-                foo.children.push_back({
-                    .children = { this->ParseAs("Identifier") },
-                    .type = "Capture", // TODO melhorar isso
-                    .value = std::nullopt
-                });
-
-                if ("," == this->current.second.value) {
-                    this->Consume();
-
-                    continue;
-                }
-
-                if ("]" == this->current.second.value)
                     break;
-            }
 
-            node.children.push_back(foo);
-        }
+                case Action::Type::Accept:
+                    return { .root = std::move(nodeStack.top()) };
 
-        this->Expect("]");
-
-        if ("(" != this->current.second.value) // TODO: improve this
-            throw std::runtime_error(std::format("Unexpected token: \'{}\' at ({}:{}:{})", this->current.second.value, this->path, this->current.first.start.y, this->current.first.start.x));
-
-        if (")" != this->current.second.value) {
-            node.children.push_back(this->ParseParameters());
-        } else {
-            this->Consume();
-            this->Consume();
-        }
-
-        if ("->" == this->current.second.value) {
-            this->Consume();
-
-            if (!this->IsType())
-                throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-
-            node.children.push_back({
-                .children = { this->ParseType() },
-                .type = "Return Type",
-                .value = std::nullopt
-            });
-        }
-
-        this->Expect("=>");
-
-        node.children.push_back(this->ParseBody());
-
-        return node;
-    }
-
-    AbstractSyntaxTree::Node ParseTypeCast() {
-        this->Consume();
-
-        AbstractSyntaxTree::Node node = {
-            .children = { this->ParseType() },
-            .type = "Type Cast",
-            .value = std::nullopt
-        };
-
-        this->Expect(")");
-
-        node.children.push_back(this->ParseExpression());
-
-        return node;
-    }
-
-    AbstractSyntaxTree::Node ParseOperand() {
-        AbstractSyntaxTree::Node node;
-
-        if (Lexer::Token::Type::Keyword == this->current.second.type) {
-            if (this->IsBultinType(this->current.second.value)) {
-                node = this->ParseType();
-
-                if ("(" == this->current.second.value)
-                    this->ParseCall(node);
-                else if ("{" == this->current.second.value)
-                    node.children.push_back(this->ParseInitializerList());
-            } else if ("false" == this->current.second.value || "true" == this->current.second.value)
-                return this->ParseAs("Literal");
-            else throw std::runtime_error("Unexpected token in operand. " + this->current.second.value);
-        } else if (Lexer::Token::Type::Literal == this->current.second.type) {
-            this->LookAhead();
-
-            if (this->IsUnaryOperator(this->future.back().second.value))
-                return this->ParseUnaryExpression();
-
-            return this->ParseAs("Literal");
-        } else if (Lexer::Token::Type::Identifier == this->current.second.type) {
-            this->LookAhead();
-
-            if (this->IsUnaryOperator(this->future.back().second.value))
-                return this->ParseUnaryExpression();
-
-            node = this->ParseAs("Identifier");
-        } else if ("(" == this->current.second.value) {
-            assert(this->future.empty());
-
-            this->LookAhead();
-
-            if (Parser::IsBultinType(this->future.back().second.value)) {
-                throw std::runtime_error("Not Implemented"); // cast | constructor
-            }
-
-            while (")" != this->future.back().second.value)
-                this->LookAhead();
-
-            this->LookAhead();
-
-            if (Lexer::Token::Type::Literal == this->future.back().second.type)
-                return this->ParseTypeCast();
-
-            this->Consume();
-
-            node = this->ParseExpression();
-
-            this->Expect(")");
-        } else if (this->IsUnaryOperator(this->current.second.value))
-            return this->ParseUnaryExpression();
-        else if ("[" == this->current.second.value) {
-            node = this->ParseLambdaExpression();
-
-            if ("(" != this->current.second.value)
-                return node;
-
-            this->ParseCall(node);
-        } else if ("{" == this->current.second.value)
-            node = this->ParseInitializerList();
-        else throw std::runtime_error("Unexpected token in operand. " + this->current.second.value);
-
-        this->ParseChain(node);
-
-        return node;
-    }
-
-    AbstractSyntaxTree::Node ParseUnaryExpression() {
-        return {
-            .children = this->IsUnaryOperator(this->current.second.value) ? (std::vector<AbstractSyntaxTree::Node>){ this->ParseAs("Operator"), this->ParseOperand() } : (std::vector<AbstractSyntaxTree::Node>){ this->ParseOperand(), this->ParseAs("Operator") },
-            .type = "Unary Expression",
-            .value = std::nullopt
-        };
-    }
-
-    AbstractSyntaxTree::Node ParseBinaryExpression(std::int32_t minPrecedence) {
-        AbstractSyntaxTree::Node left = this->ParseOperand();
-
-        while (true) {
-            std::int32_t opPrecendece = this->GetOperatorPrecendece(this->current.second.value);
-
-            if (opPrecendece < minPrecedence)
-                break;
-
-            left = {
-                .children = {
-                    std::move(left),
-                    this->ParseAs("Operator"),
-                    this->ParseBinaryExpression(opPrecendece + 1)
-                },
-                .type = "Binary Expression",
-                .value = std::nullopt
-            };
-        }
-
-        return left;
-    }
-
-    void ParseTernayExpression(AbstractSyntaxTree::Node& base) {
-        this->Consume();
-
-        AbstractSyntaxTree::Node trueCase = this->ParseExpression();
-
-        this->Expect(":");
-
-        base = {
-            .children = {
-                std::move(base),
-                std::move(trueCase),
-                this->ParseExpression()
-            },
-            .type = "Ternary Expression",
-            .value = std::nullopt
-        };
-    }
-
-    AbstractSyntaxTree::Node ParseExpression() {
-        AbstractSyntaxTree::Node node = this->ParseBinaryExpression(0);
-
-        if ("?" == this->current.second.value)
-            this->ParseTernayExpression(node);
-
-        return node;
-    }
-
-    std::vector<AbstractSyntaxTree::Node> ParseInstances() {
-        std::vector<AbstractSyntaxTree::Node> instances;
-
-        AbstractSyntaxTree::Node instance;
-
-        while (true) {
-            instance = {
-                .children = { this->ParseAs("Identifier") },
-                .type = "Instance",
-                .value = std::nullopt
-            };
-
-            if ("=" == this->current.second.value) {
-                this->Consume();
-
-                instance.children.push_back(this->ParseExpression());
-            }
-
-            instances.push_back(std::move(instance));
-
-            if ("," == this->current.second.value) {
-                this->Consume();
-
-                continue;
-            }
-
-            break;
-        }
-
-        return instances;
-    }
-
-    AbstractSyntaxTree::Node ParseVariableDeclaration() {
-        AbstractSyntaxTree::Node node = {
-            .children = { this->ParseType() },
-            .type = "Variable Declaration",
-            .value = std::nullopt
-        };
-
-        std::vector instance = this->ParseInstances();
-
-        for (auto& instanceNode : instance)
-            node.children.push_back(std::move(instanceNode));
-
-        return node;
-    }
-
-    AbstractSyntaxTree::Node ParseFunctionDeclaration() {
-        Point tmp = this->current.first.start;
-
-        AbstractSyntaxTree::Node node = {
-            .children = { this->ParseType() },
-            .type = "Function Declaration",
-            .value = std::nullopt,
-            .range = { tmp, {} }
-        };
-
-        if (Lexer::Token::Type::Identifier != this->current.second.type)
-            throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-
-        node.children.push_back(this->ParseAs("Identifier"));
-
-        if ("(" != this->current.second.value) // TODO: improve this
-            throw std::runtime_error(std::format("Unexpected token: \'{}\' at ({}:{}:{})", this->current.second.value, this->path, this->current.first.start.y, this->current.first.start.x));
-
-        node.children.push_back(this->ParseParameters());
-
-        this->Consume();
-
-        // TODO: function modifiers
-
-        if ("{" != this->current.second.value)
-            throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-
-        node.children.push_back({
-            .children = this->ParseBlock(),
-            .type = "Block",
-            .value = std::nullopt
-        });
-
-        node.range.end = this->current.first.end;
-
-        return node;
-    }
-
-    AbstractSyntaxTree::Node ParseStructure() {
-        AbstractSyntaxTree::Node node = this->ParseAs("Structure");
-
-        if (Lexer::Token::Type::Identifier == this->current.second.type)
-            node.children.push_back(this->ParseAs("Identifier"));
-
-        if (";" != this->current.second.value) {
-            if (":" == this->current.second.value) {
-                do {
-                    throw std::runtime_error("Not Implemented");
-                } while ("{" != this->current.second.value);
-            } else if ("{" != this->current.second.value)
-                throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-
-            node.children.push_back({
-                .children = this->ParseBlock(),
-                .type = "Block",
-                .value = std::nullopt
-            });
-
-            if (Lexer::Token::Type::Identifier == this->current.second.type) {
-                std::vector instance = this->ParseInstances();
-
-                for (auto& instanceNode : instance)
-                    node.children.push_back(std::move(instanceNode));
+                default:
+                    throw std::runtime_error("Parsing error");
             }
         }
-
-        return node;
-    }
-
-    AbstractSyntaxTree::Node ParsePreprocessingDirective() { // TODO: check if this method name is semantic
-        this->Consume();
-
-        if ("include" == this->current.second.value) {
-            this->Consume();
-
-            std::string path;
-
-            if ("<" == this->current.second.value) {
-                Point last = current.first.end;
-                
-                this->Consume();
-
-                if (">" != this->current.second.value) {
-                    do {
-                        if (this->current.first.start.y != last.y)
-                            throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-
-                        path.append(this->current.first.start.x - last.x, ' ');
-
-                        path.append(this->current.second.value);
-
-                        last = this->current.first.end;
-
-                        this->Consume();
-                    } while (">" != this->current.second.value);
-
-                    this->Consume();
-                } else throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-            } else if (this->current.second.value[0] == '\"' && this->current.second.value.ends_with('\"')) {
-                AbstractSyntaxTree::Node node;
-
-                std::string path = this->current.second.value.substr(1, this->current.second.value.length() - 2);
-
-                this->Consume();
-            } else throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-
-            AbstractSyntaxTree::Node node;
-
-            Parser(path, this->compiler).Parse(node);
-
-            return node;
-        }
-
-        throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-    }
-
-    AbstractSyntaxTree::Node ParseStatment() {
-        AbstractSyntaxTree::Node node;
-
-        if (Lexer::Token::Type::Punctuation == this->current.second.type) {
-            if ("#" == this->current.second.value)
-                return this->ParsePreprocessingDirective();
-
-            if ("{" == this->current.second.value)
-                return {
-                    .children = this->ParseBlock(),
-                    .type = "Block",
-                    .value = std::nullopt
-                };
-        }
-
-        if (Lexer::Token::Type::Keyword == this->current.second.type) {
-            if (IsBultinType(this->current.second.value)) {
-                node = this->ParseVariableDeclaration();
-            } else if ("struct" == this->current.second.value || "class" == this->current.second.value || "union" == this->current.second.value)
-                node = ParseStructure();
-        }
-
-        if (Lexer::Token::Type::EndOfFile == this->current.second.type)
-            throw std::runtime_error(std::format("TODO: {}:{}", __FILE__, __LINE__));
-
-        node = this->ParseExpression();
-
-        this->Expect(";");
-
-        return node;
-    }
-
-public:
-    Parser(std::string path, Compiler& compiler) noexcept : lexer(Lexer::Create(std::make_unique<std::ifstream>(path))), compiler(compiler), path(std::move(path)) {
-        this->Consume();
-        this->unaryOperators = { "-", "!", "++", "--", "*", "&" };
-        this->binaryOperators = {
-            { "=", 0 }, { "*=", 0 }, { "+=", 0 }, { "-=", 0 }, { "/=", 0 }, { "<<=", 0 }, { ">>=", 0 }, { "^=", 0 }, { "|=", 0 }, { "~=", 0 },
-            { "+", 1 }, { "-", 1 },
-            { "*", 2 }, { "/", 2 }, { "%", 2 },
-            { "==", 3 }, { "!=", 3 }, { "<", 3 }, { ">", 3 }, { "<=", 3 }, { ">=", 3 },
-            { "&&", 4 }, { "||", 5 }
-        };
-    }
-
-    void Parse(AbstractSyntaxTree::Node& root) {
-        root.type = "Program";
-        root.value = this->path;
-        root.range.start = Point<std::size_t>{ 1, 1 };
-
-        while (Lexer::Token::Type::EndOfFile != this->current.second.type)
-            root.children.push_back(this->ParseStatment());
-
-        root.range.end = root.children.back().range.end;
     }
 };
 
-class Compiler {
-    Parser              parser;
-    Symbol::Table       table;
-    AbstractSyntaxTree  ast;
+inline std::string trim(const std::string& s) {
+    auto front = std::find_if_not(s.begin(), s.end(), [](int c){ return std::isspace(c); });
+    auto back  = std::find_if_not(s.rbegin(), s.rend(), [](int c){ return std::isspace(c); }).base();
+    if (front >= back) return "";
+    return std::string(front, back);
+}
 
-public:
-    Compiler(std::filesystem::path path) : parser(path.string(), *this), table(), ast() {
-        this->parser.Parse(this->ast.root);
+void LoadGrammarFromString(std::istringstream iss, Parser::Grammar& grammar) {
+    std::string buffer;
+    std::size_t lineNum = 0;
+    std::size_t pos;
+    std::string lhs;
+    std::istringstream rhsIss;
+    std::vector<std::string> rhs;
 
-        this->ast.root.Print();
+    while (std::getline(iss, buffer)) {
+        ++lineNum;
+        buffer = trim(buffer);
+
+        if (buffer.empty()) 
+            continue;
+
+        if ('#' == buffer[0])
+            continue;
+
+        if (std::string::npos == (pos = buffer.find("->")))
+            throw std::invalid_argument(std::format("Error on line {}: Invalid format: Missing \"->\"", lineNum));
+
+        lhs = trim(buffer.substr(0, pos));
+        rhsIss.clear();
+        rhsIss.str(trim(buffer.substr(pos + 2)));
+
+        if (lhs.empty())
+            throw std::invalid_argument(std::format("Error on line {}: Empty LHS", lineNum));
+
+        grammar.AddNonTerminal(lhs);
+    
+        rhs.clear();
+        while (rhsIss >> buffer)
+            rhs.push_back(std::move(buffer));
+
+        if (rhs.empty())
+            throw std::invalid_argument(std::format("Error on line {}: Empty RHS", lineNum));
+
+        if ("ε" == rhs[0]) {
+            if (1 != rhs.size())
+                throw std::runtime_error("DOES NOT KNOW WHAT TO DO!");
+
+            rhs.clear();
+        }
+
+        std::cout << "Adding new production: " << lhs << " { ";
+        for (const auto& rhsIt : rhs)
+            std::cout << rhsIt << " ";
+        std::cout << '}' << std::endl;
+
+        grammar.AddProduction(std::move(lhs), std::move(rhs));
     }
-};
+
+    grammar.BuildParsingTable();
+}
+
+void LoadGrammarFromFile(const std::string& filename, Parser::Grammar& grammar) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file)
+        throw std::runtime_error("Unable to open: " + filename);
+    std::ostringstream buf;
+    buf << file.rdbuf();
+    LoadGrammarFromString(std::istringstream(buf.str()), grammar);
+}
 
 int main(int argc, const char** argv) {
-    Compiler compiler(argv[1]);
+    std::shared_ptr keywords = std::make_shared<PrefixTree>();
+
+    std::initializer_list<std::string_view> terminalKeywords = {
+        "auto", "bool", "case", "catch", "char", "const", "constexpr", "continue", "default", "do", "double", "else", "false", "float", "for", "if", "int", "long", "mutable", "namespace", "private", "protected", "return", "short", "switch", "throw", "true", "void", "volatile", "while"
+    };
+
+    keywords->Insert(terminalKeywords);
+
+    std::shared_ptr punctuation = std::make_shared<PrefixTree>();
+
+    std::initializer_list<std::string_view> terminalPunctuaction = {
+        "!", "#", "$", "%", "&", "(", ")", "*", "+", ",", "-", ".", "/", ":", ";", "<", "=", ">", "?", "@", "[", "]", "^", "{", "|", "}", "~",
+        "&&", "++", "--", "..", "...", "::", "<<", "==", ">>", "[[", "||", "]]",
+        "!=", "%=", "&=", "*=", "+=", "-=", "/=", "<=", "<<=", ">=", ">>=", "^=", "|=", "~=", "->", "=>"
+    };
+
+    punctuation->Insert(terminalPunctuaction);
+
+    Parser::Grammar grammar("S");
+
+    for (const auto& terminal : terminalKeywords)
+        grammar.AddTerminal(std::string(terminal));
+
+    for (const auto& terminal : terminalPunctuaction)
+        grammar.AddTerminal(std::string(terminal));
+
+    LoadGrammarFromFile("grammar.txt", grammar);
+
+    Parser parser(Lexer(std::make_unique<std::ifstream>(argv[1]), std::move(keywords), std::move(punctuation)), grammar.GetModel());
+
+    parser.Parse().root.Print();
 
     return 0;
 }
 
-// if (true) struct...
+// static memory allocation
+
+/*
+
+auto file = std::make_unique<std::ifstream>(argv[1]);
+
+auto lexer = Lexer::Create(std::move(file));
+
+Lexer::Token token;
+
+std::unordered_map<Lexer::Token::Type, std::string_view> typeTable = {
+    { Lexer::Token::Type::EndOfFile, "EndOfFile" },
+    { Lexer::Token::Type::Error, "Error" },
+    { Lexer::Token::Type::Identifier, "Identifier" },
+    { Lexer::Token::Type::Keyword, "Keyword" },
+    { Lexer::Token::Type::Literal, "Literal" },
+    { Lexer::Token::Type::Punctuation, "Punctuation" },
+    { Lexer::Token::Type::Unknown, "Unknown" }
+};
+
+while (Lexer::Token::Type::EndOfFile != (token = lexer.GetNextToken()).metadata.type) {
+    std::cout << std::format(
+        "{{\n\t\033[33mdata\033[0m: \"\033[32m{}\033[0m\",\n\t\033[33mmetadata\033[0m: {{\n\t\t\033[35mtype\033[0m: \"\033[32m{}\033[0m\",\n\t\t\033[35mrange\033[0m: {{\n\t\t\t\033[36mstart\033[0m: {{\n\t\t\t\t\033[33mx\033[0m: \033[32m{}\033[0m,\n\t\t\t\t\033[33my\033[0m: \033[32m{}\033[0m\n\t\t\t}}, \033[36mend\033[0m: {{\n\t\t\t\t\033[33mx\033[0m: \033[32m{}\033[0m,\n\t\t\t\t\033[33my\033[0m: \033[32m{}\033[0m\n\t\t\t}}\n\t\t}}\n\t}}\n}}\033[0m"
+        " "
+        "{}:{}:{} {}:{}:{}",
+        token.data,
+        typeTable[token.metadata.type],
+        token.metadata.range.start.x, token.metadata.range.start.y,
+        token.metadata.range.end.x, token.metadata.range.end.y,
+        argv[1], token.metadata.range.start.y, token.metadata.range.start.x,
+        argv[1], token.metadata.range.end.y, token.metadata.range.end.x
+    ) << std::endl;
+}
+
+*/
