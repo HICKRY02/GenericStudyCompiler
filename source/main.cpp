@@ -2,6 +2,9 @@
 
 #include <fstream>
 #include <locale>
+#include <sstream>
+
+using namespace GenericStudyCompiler;
 
 int main(int argc, const char** argv) {
     std::setlocale(LC_ALL, "en_US.UTF-8");
@@ -24,9 +27,29 @@ int main(int argc, const char** argv) {
 
     punctuation->Insert(terminalPunctuaction);
 
-    auto grammar = Serializer<Parser::Grammar>::Deserialize(std::ifstream(argv[1]));
+    auto grammar = Serializer<Parser::Grammar>::Deserialize(std::istringstream(
+    R"#(<BuiltinType> ::= "bool" | "char" | "double" | "float" | "int" | "long" | "short" | "void"
 
-    Parser parser(Lexer(std::make_unique<std::ifstream>(argv[2]), std::move(keywords), std::move(punctuation)), grammar.GetModel());
+        <Declarations> ::= {(<NamespaceDeclaration> | <VariableDeclaration>)}
+
+        <DeclarationsBlock> ::= "{" [<Declarations>] "}"
+
+        @soluble
+        <Instance> ::= "Identifier"
+
+        <Instances> ::= <Instance> [{"," <Instance>}]
+
+        <NamespaceDeclaration> ::= "namespace" "Identifier" <DeclarationsBlock>
+
+        @start
+        <Program> ::= [<Declarations>]
+
+        <Type> ::= (<BuiltinType> | "Identifier")
+
+        <VariableDeclaration> ::= <Type> <Instances> ";")#"
+    ));
+
+    Parser parser(Lexer(std::make_unique<std::ifstream>(argv[1]), std::move(keywords), std::move(punctuation)), grammar.GetModel());
 
     parser.Parse();
 
